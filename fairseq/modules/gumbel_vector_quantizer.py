@@ -158,12 +158,12 @@ class GumbelVectorQuantizer(nn.Module):
         return res
 
     def forward_idx(self, x):
-        """Forward with produce_targets flag, then return `x` and `target`
+        """Convert feature sequences into quantized representative and index series.
 
         Args:
             x: Input (Batch, Time, Feature) if time_first else (Batch, Feature, Time)
         Returns:
-            (sampled vector series, ?)
+            Sampled quantized series - (representative:(B, T, vq_dim), index:(B, T, G))
         """
         res = self.forward(x, produce_targets=True)
         return res["x"], res["targets"]
@@ -181,7 +181,7 @@ class GumbelVectorQuantizer(nn.Module):
             'prob_perplexity'
             'temp': Temperature at sampling
             'x' (B, T, vq_dim==G*var_dim): Sampled representative vector series
-            'targets' Optional[(B, T, G)]: One-hot vector series for training targets
+            'targets' Optional[(B, T, G)]: Index vector series for training targets
         }
         """
 
@@ -240,7 +240,7 @@ class GumbelVectorQuantizer(nn.Module):
         if self.combine_groups:
             vars = vars.repeat(1, self.groups, 1)
 
-        # Produce one-hot vectors for training target
+        # Produce index series for training target
         if produce_targets:
             result["targets"] = (
                 # (B*T, G*V) => (B*T*G, V)
