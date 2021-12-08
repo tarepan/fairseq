@@ -239,6 +239,12 @@ class Wav2Vec2Config(FairseqDataclass):
 
 @register_model("wav2vec2", dataclass=Wav2Vec2Config)
 class Wav2Vec2Model(BaseFairseqModel):
+    """The wav2vec 2.0 model.
+
+    Variants:
+        Continuous/Discrete: Controlled by `quantize_input`, `quantize_targets` and `same_quantizer`
+    """
+
     def __init__(self, cfg: Wav2Vec2Config):
         super().__init__()
         self.cfg = cfg
@@ -246,6 +252,9 @@ class Wav2Vec2Model(BaseFairseqModel):
         feature_enc_layers = eval(cfg.conv_feature_layers)
         self.embed = feature_enc_layers[-1][0]
 
+        # Extract feature series from time series
+        #     model: (Conv1d-DO[-Norm]-GELU)xN
+        #     (Batch, Time) => (Batch, Channel, Time')
         self.feature_extractor = ConvFeatureExtractionModel(
             conv_layers=feature_enc_layers,
             dropout=0.0,
@@ -279,9 +288,6 @@ class Wav2Vec2Model(BaseFairseqModel):
 
         self.feature_grad_mult = cfg.feature_grad_mult
 
-        self.quantizer = None
-        self.input_quantizer = None
-
         self.n_negatives = cfg.num_negatives
         self.cross_sample_negatives = cfg.cross_sample_negatives
         self.codebook_negatives = cfg.codebook_negatives
@@ -291,6 +297,9 @@ class Wav2Vec2Model(BaseFairseqModel):
 
         final_dim = cfg.final_dim if cfg.final_dim > 0 else cfg.encoder_embed_dim
 
+        # Quantization
+        ## Target quantizer
+        self.quantizer = None
         if cfg.quantize_targets:
             vq_dim = cfg.latent_dim if cfg.latent_dim > 0 else final_dim
             self.quantizer = GumbelVectorQuantizer(
@@ -307,7 +316,8 @@ class Wav2Vec2Model(BaseFairseqModel):
             self.project_q = nn.Linear(vq_dim, final_dim)
         else:
             self.project_q = nn.Linear(self.embed, final_dim)
-
+        ## Input quantizer
+        self.input_quantizer = None
         if cfg.quantize_input:
             if cfg.same_quantizer and self.quantizer is not None:
                 vq_dim = final_dim
@@ -326,11 +336,13 @@ class Wav2Vec2Model(BaseFairseqModel):
                     weight_proj_factor=cfg.quantizer_factor,
                 )
             self.project_inp = nn.Linear(vq_dim, cfg.encoder_embed_dim)
+        # /
 
         self.mask_emb = nn.Parameter(
             torch.FloatTensor(cfg.encoder_embed_dim).uniform_()
         )
 
+        # Convert feature z into context c
         self.encoder = TransformerEncoder(cfg)
         self.layer_norm = LayerNorm(self.embed)
 
@@ -530,7 +542,13 @@ class Wav2Vec2Model(BaseFairseqModel):
         mask_channel_indices=None,
         padding_count=None,
     ):
+        """
+        x => z => c
+        Args:
+            features_only: Whether to compute just `c` or fully compute including contrastive terms
+        """
 
+        # x/waveform => z/feature_series
         if self.feature_grad_mult > 0:
             features = self.feature_extractor(source)
             if self.feature_grad_mult != 1.0:
@@ -545,6 +563,7 @@ class Wav2Vec2Model(BaseFairseqModel):
         features = self.layer_norm(features)
         unmasked_features = features.clone()
 
+        # Mask
         if padding_mask is not None and padding_mask.any():
             input_lengths = (1 - padding_mask.long()).sum(-1)
             # apply conv formula to get real output_lengths
@@ -565,6 +584,7 @@ class Wav2Vec2Model(BaseFairseqModel):
             padding_mask = (1 - padding_mask.flip([-1]).cumsum(-1).flip([-1])).bool()
         else:
             padding_mask = None
+        # /
 
         if self.post_extract_proj is not None:
             features = self.post_extract_proj(features)
@@ -577,6 +597,7 @@ class Wav2Vec2Model(BaseFairseqModel):
         prob_ppl = None
         curr_temp = None
 
+        # Quantization: z => q for Transformer input
         if self.input_quantizer:
             q = self.input_quantizer(features, produce_targets=False)
             features = q["x"]
@@ -586,6 +607,7 @@ class Wav2Vec2Model(BaseFairseqModel):
             curr_temp = q["temp"]
             features = self.project_inp(features)
 
+        # Masking
         if mask:
             x, mask_indices = self.apply_mask(
                 features,
@@ -606,8 +628,10 @@ class Wav2Vec2Model(BaseFairseqModel):
             y = unmasked_features
             mask_indices = None
 
+        # TransformerEncoder: (z | q) => c
         x, layer_results = self.encoder(x, padding_mask=padding_mask, layer=layer)
 
+        # Only 'x => z => c', no contrastive loss related things
         if features_only:
             return {
                 "x": x,
@@ -616,7 +640,9 @@ class Wav2Vec2Model(BaseFairseqModel):
                 "layer_results": layer_results,
             }
 
+        # Quantization: z => q for contrastive target
         if self.quantizer:
+            # (Batch, Time, Feature) => 
             q = self.quantizer(y, produce_targets=False)
             y = q["x"]
             num_vars = q["num_vars"]
@@ -697,13 +723,33 @@ class Wav2Vec2Model(BaseFairseqModel):
         return result
 
     def quantize(self, x):
+        """Quantize waveforms.
+
+        Compute x => z => q (No context calculation).
+        Args:
+            x (Batch, Time): Waveform
+        Returns:
+            Representative vector series and its index series
+        """
+
+        # Validation: Quantization is ON w/ config
         assert self.quantizer is not None
-        x = self.feature_extractor(x)
-        x = x.transpose(1, 2)
+
+        # `x`:(Batch, Time) => `z`:(Batch, Feature, Time') => (Batch, Time', Feature)
+        x = self.feature_extractor(x).transpose(1, 2)
         x = self.layer_norm(x)
+        # `z`:(B, T', F) => (q:(B, T', F'), q_idx:(B, T', G))
         return self.quantizer.forward_idx(x)
 
     def extract_features(self, source, padding_mask, mask=False, layer=None):
+        """Compute context feature.
+
+        Compute x => z => c.
+        Contrastive terms are not computed because it is not needed for context feature extraction.
+        Args:
+            source (Batch, Time) - input waveform
+        """
+
         res = self.forward(
             source, padding_mask, mask=mask, features_only=True, layer=layer
         )
@@ -741,6 +787,10 @@ class Wav2Vec2Model(BaseFairseqModel):
 
 
 class ConvFeatureExtractionModel(nn.Module):
+    """Convert time series into feature series with Convolution.
+
+    model: (Conv1d-DO[-Norm]-GELU)xN
+    """
     def __init__(
         self,
         conv_layers: List[Tuple[int, int, int]],
@@ -750,6 +800,7 @@ class ConvFeatureExtractionModel(nn.Module):
     ):
         super().__init__()
 
+        # Assertion: config type
         assert mode in {"default", "layer_norm"}
 
         def block(
@@ -761,16 +812,26 @@ class ConvFeatureExtractionModel(nn.Module):
             is_group_norm=False,
             conv_bias=False,
         ):
+            """Generate a convolution block.
+
+            Generate Conv1d-DO[-Norm]-GELU module.
+            Normalization is switched with argument.
+            """
+
             def make_conv():
+                """Generate Conv1d module w/ kaiming_normal initialization."""
                 conv = nn.Conv1d(n_in, n_out, k, stride=stride, bias=conv_bias)
                 nn.init.kaiming_normal_(conv.weight)
                 return conv
 
+            # Assertion: Normalization configs are not conflicted.
             assert (
                 is_layer_norm and is_group_norm
             ) == False, "layer norm and group norm are exclusive"
 
+            # Switch LN/GN/noNorm
             if is_layer_norm:
+                # Conv1d-DO-LN-GELU
                 return nn.Sequential(
                     make_conv(),
                     nn.Dropout(p=dropout),
@@ -782,6 +843,7 @@ class ConvFeatureExtractionModel(nn.Module):
                     nn.GELU(),
                 )
             elif is_group_norm:
+                # Conv1d-DO-GN-GELU
                 return nn.Sequential(
                     make_conv(),
                     nn.Dropout(p=dropout),
@@ -789,9 +851,11 @@ class ConvFeatureExtractionModel(nn.Module):
                     nn.GELU(),
                 )
             else:
+                # Conv1d-DO-GELU
                 return nn.Sequential(make_conv(), nn.Dropout(p=dropout), nn.GELU())
 
         in_d = 1
+        # All computation stacked here
         self.conv_layers = nn.ModuleList()
         for i, cl in enumerate(conv_layers):
             assert len(cl) == 3, "invalid conv definition: " + str(cl)
@@ -808,11 +872,19 @@ class ConvFeatureExtractionModel(nn.Module):
                     conv_bias=conv_bias,
                 )
             )
+            # dim_o_layer_k (`dim`) = dim_i_layer_k+1 (`in_d`)
             in_d = dim
 
     def forward(self, x):
+        """Convert time series into feature series.
 
-        # BxT -> BxCxT
+        Args:
+            x (Batch, Time) - input sequence
+        Returns:
+            (Batch, Channel, Time') - feature sequence
+        """
+
+        # (Batch, Time) => (Batch, Channel, Time)
         x = x.unsqueeze(1)
 
         for conv in self.conv_layers:
@@ -822,6 +894,7 @@ class ConvFeatureExtractionModel(nn.Module):
 
 
 class TransformerEncoder(nn.Module):
+    """The Transformer Encoder module."""
     def __init__(self, args):
         super().__init__()
 
@@ -843,6 +916,7 @@ class TransformerEncoder(nn.Module):
         self.pos_conv = nn.utils.weight_norm(self.pos_conv, name="weight", dim=2)
         self.pos_conv = nn.Sequential(self.pos_conv, SamePad(args.conv_pos), nn.GELU())
 
+        # Transformer Encoder layers, 'Res(MHA)-Res(FFN)'
         layers = []
         for _ in range(args.encoder_layers):
             layer = TransformerSentenceEncoderLayer(
@@ -876,6 +950,13 @@ class TransformerEncoder(nn.Module):
         return x, layer_results
 
     def extract_features(self, x, padding_mask=None, tgt_layer=None):
+        """
+        Args:
+            x: Input feature sequence.
+            tgt_layer: Record each layer's result (history) and stop layer calculation at this layer.
+        Returns:
+            (last output, layer history)
+        """
 
         if padding_mask is not None:
             x = index_put(x, padding_mask, 0)
@@ -889,17 +970,23 @@ class TransformerEncoder(nn.Module):
 
         x = F.dropout(x, p=self.dropout, training=self.training)
 
-        # B x T x C -> T x B x C
+        # (Batch, Time, Channel) => (Time, Batch, Channel)
         x = x.transpose(0, 1)
 
+        # Encoder layers w/ random layer drop
+        # `x` is latest state, `layer_results` is history.
         layer_results = []
         r = None
         for i, layer in enumerate(self.layers):
+            # Random layer drop
             dropout_probability = np.random.random()
+
+            # Evalution | (Training & non droped layer)
             if not self.training or (dropout_probability > self.layerdrop):
                 x, z = layer(x, self_attn_padding_mask=padding_mask, need_weights=False)
                 if tgt_layer is not None:
                     layer_results.append((x, z))
+            # Stop at specified layer
             if i == tgt_layer:
                 r = x
                 break
@@ -907,7 +994,7 @@ class TransformerEncoder(nn.Module):
         if r is not None:
             x = r
 
-        # T x B x C -> B x T x C
+        # (Time, Batch, Channel) => (Batch, Time, Channel)
         x = x.transpose(0, 1)
 
         return x, layer_results
@@ -923,8 +1010,8 @@ class TransformerEncoder(nn.Module):
 
 class TransformerSentenceEncoderLayer(nn.Module):
     """
-    Implements a Transformer Encoder Layer used in BERT/XLM style pre-trained
-    models.
+    Transformer Encoder Layer used in BERT/XLM style pre-trained models.
+    Basically, the model is 'Res(MHA)-Res(FFN)'.
     """
 
     def __init__(
@@ -983,7 +1070,10 @@ class TransformerSentenceEncoderLayer(nn.Module):
         residual = x
 
         if self.layer_norm_first:
+            # Res(LN-MHA-DO)-Res(LN-FNN-DO)
+            # LN
             x = self.self_attn_layer_norm(x)
+            # MHA
             x, attn = self.self_attn(
                 query=x,
                 key=x,
@@ -991,35 +1081,47 @@ class TransformerSentenceEncoderLayer(nn.Module):
                 key_padding_mask=self_attn_padding_mask,
                 attn_mask=self_attn_mask,
             )
+            # DO
             x = self.dropout1(x)
+            # Res
             x = residual + x
 
             residual = x
+            # LN
             x = self.final_layer_norm(x)
+            # FNN (segFC-DO-segFC-DO)
             x = self.activation_fn(self.fc1(x))
             x = self.dropout2(x)
             x = self.fc2(x)
             x = self.dropout3(x)
+            # Res
             x = residual + x
         else:
+            # Res(MHA-DO)-LN-Res(FNN-DO)-LN
+            # MHA
             x, attn = self.self_attn(
                 query=x,
                 key=x,
                 value=x,
                 key_padding_mask=self_attn_padding_mask,
             )
-
+            # DO
             x = self.dropout1(x)
+            # Res
             x = residual + x
 
+            # LN
             x = self.self_attn_layer_norm(x)
 
             residual = x
+            # FNN (segFC-DO-segFC-DO)
             x = self.activation_fn(self.fc1(x))
             x = self.dropout2(x)
             x = self.fc2(x)
             x = self.dropout3(x)
+            # Res
             x = residual + x
+            # LN
             x = self.final_layer_norm(x)
 
         return x, attn
