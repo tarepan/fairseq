@@ -165,7 +165,7 @@ class GumbelVectorQuantizer(nn.Module):
         Returns:
             Sampled quantized series - (representative:(B, T, vq_dim), index:(B, T, G))
         """
-        res = self.forward(x, produce_targets=True)
+        res = self(x, produce_targets=True)
         return res["x"], res["targets"]
 
     def forward(self, x, produce_targets=False):
