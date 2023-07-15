@@ -6,7 +6,9 @@
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
+import pytest
 from typing import Optional
+from unittest.mock import patch
 
 import torch
 
@@ -36,9 +38,10 @@ class EMAConfig(object):
     ema_start_update: int = 0
     ema_fp32: bool = False
     ema_seed_model: Optional[str] = None
+    ema_update_freq: int = 1
 
 
-class TestEMAGPU(unittest.TestCase):
+class TestEMA(unittest.TestCase):
     def assertTorchAllClose(self, x, y, atol=1e-8, rtol=1e-5, msg=None):
         diff = x.float() - y.float()
         diff_norm = torch.norm(diff)
@@ -104,15 +107,70 @@ class TestEMAGPU(unittest.TestCase):
             ema_param = ema_state_dict[key]
             self.assertTrue(torch.allclose(ema_param, param))
 
+        # Check that step_internal is called once
+        with patch.object(ema, "_step_internal", return_value=None) as mock_method:
+            ema.step(model)
+            mock_method.assert_called_once_with(model, None)
+
+    def _test_ema_start_update(self, updates):
+        model = DummyModule()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        state = deepcopy(model.state_dict())
+        config = EMAConfig(ema_start_update=1)
+        ema = EMA(model, config)
+
+        # EMA step
+        x = torch.randn(32)
+        y = model(x)
+        loss = y.sum()
+        loss.backward()
+        optimizer.step()
+
+        ema.step(model, updates=updates)
+        ema_state_dict = ema.get_model().state_dict()
+
+        self.assertEqual(ema.get_decay(), 0 if updates == 0 else config.ema_decay)
+
+        for key, param in model.state_dict().items():
+            ema_param = ema_state_dict[key]
+            prev_param = state[key]
+
+            if "version" in key:
+                # Do not decay a model.version pytorch param
+                continue
+            if updates == 0:
+                self.assertTorchAllClose(
+                    ema_param,
+                    param,
+                )
+            else:
+                self.assertTorchAllClose(
+                    ema_param,
+                    config.ema_decay * prev_param + (1 - config.ema_decay) * param,
+                )
+
+        # Check that step_internal is called once
+        with patch.object(ema, "_step_internal", return_value=None) as mock_method:
+            ema.step(model, updates=updates)
+            mock_method.assert_called_once_with(model, updates)
+
+    def test_ema_before_start_update(self):
+        self._test_ema_start_update(updates=0)
+
+    def test_ema_after_start_update(self):
+        self._test_ema_start_update(updates=1)
+
     def test_ema_fp32(self):
-        model = DummyModule().half()
+        dtype = torch.float
+
+        model = DummyModule().to(dtype)
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
         state = deepcopy(model.state_dict())
         config = EMAConfig(ema_fp32=True)
         ema = EMA(model, config)
 
         x = torch.randn(32)
-        y = model(x.half())
+        y = model(x.to(dtype))
         loss = y.sum()
         loss.backward()
         optimizer.step()
@@ -137,7 +195,7 @@ class TestEMAGPU(unittest.TestCase):
                         config.ema_decay * prev_param.float()
                         + (1 - config.ema_decay) * param.float()
                     )
-                    .half()
+                    .to(dtype)
                     .float()
                 ),
                 torch.norm(
@@ -152,11 +210,15 @@ class TestEMAGPU(unittest.TestCase):
                 (
                     config.ema_decay * prev_param.float()
                     + (1 - config.ema_decay) * param.float()
-                ).half(),
+                ).to(dtype),
             )
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason="CPU no longer supports Linear in half precision",
+    )
     def test_ema_fp16(self):
-        model = DummyModule().half()
+        model = DummyModule().cuda().half()
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
         state = deepcopy(model.state_dict())
         config = EMAConfig(ema_fp32=False)
@@ -165,7 +227,7 @@ class TestEMAGPU(unittest.TestCase):
         # Since fp32 params is not used, it should be of size 0
         self.assertEqual(len(ema.fp32_params), 0)
 
-        x = torch.randn(32)
+        x = torch.randn(32).cuda()
         y = model(x.half())
         loss = y.sum()
         loss.backward()

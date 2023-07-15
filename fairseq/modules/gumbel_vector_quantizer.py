@@ -21,6 +21,8 @@ class GumbelVectorQuantizer(nn.Module):
         activation=nn.GELU(),
         weight_proj_depth:int=1,
         weight_proj_factor=1,
+        hard=True,
+        std=0,
     ):
         """Vector quantization using gumbel softmax
 
@@ -48,6 +50,7 @@ class GumbelVectorQuantizer(nn.Module):
         self.input_dim = dim
         self.num_vars = num_vars
         self.time_first = time_first
+        self.hard = hard
 
         assert (
             vq_dim % groups == 0
@@ -59,7 +62,10 @@ class GumbelVectorQuantizer(nn.Module):
 
         # Full Codebook: (1, G*V, var_dim)
         self.vars = nn.Parameter(torch.FloatTensor(1, num_groups * num_vars, var_dim))
-        nn.init.uniform_(self.vars)
+        if std == 0:
+            nn.init.uniform_(self.vars)
+        else:
+            nn.init.normal_(self.vars, mean=0, std=std)
 
         # Projection: Linear/non-Linear projection for dimension matching
         #     depth>1: vec_i::(B, T, C) -> [FC_{factor}-σ]x{depth} -> (B, T, G*V)
@@ -105,7 +111,7 @@ class GumbelVectorQuantizer(nn.Module):
             num_updates: Number of cool/decay
         """
         self.curr_temp = max(
-            self.max_temp * self.temp_decay ** num_updates, self.min_temp
+            self.max_temp * self.temp_decay**num_updates, self.min_temp
         )
 
     def get_codebook_indices(self):
@@ -120,7 +126,7 @@ class GumbelVectorQuantizer(nn.Module):
 
             if not self.combine_groups:
                 self.codebook_indices = self.codebook_indices.view(
-                    self.num_vars ** self.groups, -1
+                    self.num_vars**self.groups, -1
                 )
                 for b in range(1, self.groups):
                     self.codebook_indices[:, b] += self.num_vars * b
@@ -134,7 +140,7 @@ class GumbelVectorQuantizer(nn.Module):
             self.vars.squeeze(0)
             # (G*V, var_dim) => (dim_indices, var_dim)
             .index_select(0, indices)
-            .view(self.num_vars ** self.groups, -1)
+            .view(self.num_vars**self.groups, -1)
         )
 
     def sample_from_codebook(self, b, n):
@@ -154,7 +160,7 @@ class GumbelVectorQuantizer(nn.Module):
         res = indices.new_full(indices.shape[:-1], 0)
         for i in range(self.groups):
             exponent = self.groups - i - 1
-            res += indices[..., i] * (self.num_vars ** exponent)
+            res += indices[..., i] * (self.num_vars**exponent)
         return res
 
     def forward_idx(self, x):
@@ -202,16 +208,17 @@ class GumbelVectorQuantizer(nn.Module):
         x = x.view(bsz * tsz * self.groups, -1)
 
         # Undifferentiable sampling: Argmax
-        _, k = x.max(-1)
-        hard_x = (
-            x.new_zeros(*x.shape)
-            .scatter_(-1, k.view(-1, 1), 1.0)
-            .view(bsz * tsz, self.groups, -1)
-        )
-        hard_probs = torch.mean(hard_x.float(), dim=0)
-        result["code_perplexity"] = torch.exp(
-            -torch.sum(hard_probs * torch.log(hard_probs + 1e-7), dim=-1)
-        ).sum()
+        with torch.no_grad():
+            _, k = x.max(-1)
+            hard_x = (
+                x.new_zeros(*x.shape)
+                .scatter_(-1, k.view(-1, 1), 1.0)
+                .view(bsz * tsz, self.groups, -1)
+            )
+            hard_probs = torch.mean(hard_x.float(), dim=0)
+            result["code_perplexity"] = torch.exp(
+                -torch.sum(hard_probs * torch.log(hard_probs + 1e-7), dim=-1)
+            ).sum()
         # /
 
         avg_probs = torch.softmax(
@@ -227,7 +234,9 @@ class GumbelVectorQuantizer(nn.Module):
         # Differential hard random sampling
         if self.training:
             # (B*T*G, V) => (B*T*G, V), last dim is one-hot vector
-            x = F.gumbel_softmax(x.float(), tau=self.curr_temp, hard=True).type_as(x)
+            x = F.gumbel_softmax(x.float(), tau=self.curr_temp, hard=self.hard).type_as(
+                x
+            )
         # Differential is not necessary, so Argmax sampling is enough.
         else:
             x = hard_x

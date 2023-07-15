@@ -7,8 +7,9 @@ from collections import defaultdict
 from itertools import chain
 
 import torch
-from fairseq import optim
 from omegaconf import DictConfig
+
+from fairseq import optim
 
 from .dynamic_loss_scaler import DynamicLossScaler
 
@@ -71,6 +72,8 @@ class _FP16OptimizerMixin(object):
                 p32.grad = torch.zeros_like(p32.data)
                 if hasattr(p, "param_group"):
                     p32.param_group = p.param_group
+                if hasattr(p, "optim_overrides"):
+                    p32.optim_overrides = p.optim_overrides
                 fp32_params.append(p32)
             return fp32_params
 
@@ -193,6 +196,9 @@ class _FP16OptimizerMixin(object):
             0, aggregate_norm_fn
         )
 
+        if torch.is_tensor(self._multiply_factor):
+            self._multiply_factor = self._multiply_factor.to(grad_norm.device)
+
         if self.scaler is not None:
             if grad_norm > max_norm > 0.0:
                 self._multiply_factor *= max_norm / grad_norm
@@ -265,7 +271,7 @@ class FP16Optimizer(_FP16OptimizerMixin, optim.FairseqOptimizer):
                 / cfg.common.model_parallel_size
             )
             scale_window = int(
-                2 ** 14 / data_parallel_size / cfg.optimization.update_freq[0]
+                2**14 / data_parallel_size / cfg.optimization.update_freq[0]
             )
         else:
             scale_window = cfg.common.fp16_scale_window
@@ -499,7 +505,7 @@ class MemoryEfficientFP16Optimizer(
                 / cfg.common.model_parallel_size
             )
             scale_window = int(
-                2 ** 14 / data_parallel_size / cfg.optimization.update_freq[0]
+                2**14 / data_parallel_size / cfg.optimization.update_freq[0]
             )
         else:
             scale_window = cfg.common.fp16_scale_window

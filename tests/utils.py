@@ -8,7 +8,9 @@ import json
 import os
 import random
 import shutil
+import string
 import sys
+import typing as tp
 from io import StringIO
 
 import torch
@@ -164,7 +166,9 @@ def sequence_generator_setup():
     return tgt_dict, w1, w2, src_tokens, src_lengths, model
 
 
-def create_dummy_data(data_dir, num_examples=100, maxlen=20, alignment=False, languages=None):
+def create_dummy_data(
+    data_dir, num_examples=100, maxlen=20, alignment=False, languages=None
+):
     def _create_dummy_data(dir, filename):
         data = torch.rand(num_examples * maxlen)
         data = 97 + torch.floor(26 * data).int()
@@ -195,8 +199,15 @@ def create_dummy_data(data_dir, num_examples=100, maxlen=20, alignment=False, la
                 )
                 print(ex_str, file=h)
 
-    files_to_write = ['train.in', 'train.out', 'valid.in', 'valid.out', 'test.in', 'test.out']
-    if languages is None: # En only dummy dataset
+    files_to_write = [
+        "train.in",
+        "train.out",
+        "valid.in",
+        "valid.out",
+        "test.in",
+        "test.out",
+    ]
+    if languages is None:  # En only dummy dataset
         for f in files_to_write:
             _create_dummy_data(data_dir, f)
     else:
@@ -232,7 +243,7 @@ def preprocess_lm_data(data_dir, languages=None):
     else:
         for lang in languages:
             lang_dir = os.path.join(data_dir, lang)
-            assert(os.path.exists(lang_dir))
+            assert os.path.exists(lang_dir)
             preprocess_args = preprocess_parser.parse_args(
                 [
                     "--only-source",
@@ -248,8 +259,9 @@ def preprocess_lm_data(data_dir, languages=None):
             )
             preprocess.main(preprocess_args)
         shutil.copyfile(
-            os.path.join(data_dir, languages[0], 'dict.txt'), os.path.join(data_dir, 'dict.txt'))
-
+            os.path.join(data_dir, languages[0], "dict.txt"),
+            os.path.join(data_dir, "dict.txt"),
+        )
 
 
 def preprocess_translation_data(data_dir, extra_flags=None):
@@ -482,7 +494,7 @@ class TestTranslationTask(LegacyFairseqTask):
     def setup_task(cls, args, src_dict=None, tgt_dict=None, model=None):
         return cls(args, src_dict, tgt_dict, model)
 
-    def build_model(self, args):
+    def build_model(self, args, from_checkpoint=False):
         return TestModel.build_model(args, self)
 
     @property
@@ -746,3 +758,40 @@ def train_language_model(
             + (extra_valid_flags or []),
         )
         validate.main(validate_args)
+
+
+def sizes(data):
+    return [len(sentence) for sentence in data]
+
+
+POPULATION = string.ascii_letters + string.digits
+
+
+def make_sentence() -> tp.List[str]:
+    length = random.randint(10, 50)
+    return random.choices(
+        population=POPULATION, k=length, weights=range(1, len(POPULATION) + 1)
+    )
+
+
+def make_data(length=1000, out_file=None) -> tp.List[tp.List[str]]:
+    data = (
+        [make_sentence() for _ in range(0, length)]
+        # add all the symbols at least once
+        + [list(string.ascii_letters), list(string.digits)]
+    )
+    if out_file is not None:
+        with open(out_file, "w", encoding="utf-8") as out:
+            for s in data:
+                print(" ".join(s), file=out)
+
+    return data
+
+
+def build_vocab(data: tp.List[tp.List[str]]) -> Dictionary:
+    d = Dictionary()
+    for s in data:
+        for token in s:
+            d.add_symbol(token)
+    d.finalize()
+    return d
